@@ -6,6 +6,7 @@ from typing import List, Optional
 from strawberry.fastapi import GraphQLRouter
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
+from strawberry.dataloader import DataLoader
 
 SECRET_KEY = "super-secret-key-for-lab"
 ALGORITHM = "HS256"
@@ -19,22 +20,24 @@ class AuthSchema(BaseModel):
     username: str = Field(..., description="Логин (email)")
     password: str = Field(..., description="Пароль")
 
-"/api/auth/register", status_code=status.HTTP_201_CREATED
+@app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
 def register(user: AuthSchema):
     if user.username in users_db:
         raise HTTPException(status_code=400, detail="User already exists")
     users_db[user.username] = user.password 
     return {"message": "User registered successfully"}
 
-"/api/auth/login"
+@app.post("/api/auth/login")
 def login(user: AuthSchema):
     if users_db.get(user.username) != user.password:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     token = jwt.encode({"sub": user.username}, SECRET_KEY, algorithm=ALGORITHM)
     return {"token": token}
 
-# --- 2. GRAPHQL GATEWAY ---
-REST_CATALOG_URL = "http://127.0.0"
+
+# --- 2. GRAPHQL GATEWAY (АДРЕС ВЕДЕТ СТРОГО НА ЦИФРОВОЙ IP И ПОРТ 8001) ---
+REST_CATALOG_URL = "http://127.0.0.1:8001/api/catalog/products"
+
 
 ORDERS_DB = [
     {
@@ -53,7 +56,8 @@ ORDERS_DB = [
 
 async def batch_load_products(keys: List[str]) -> List["Product"]:
     async with httpx.AsyncClient() as client:
-        tasks = [client.get(f"{REST_CATALOG_URL}/{product_id}") for product_id in keys]
+        # Передаем ID как int, чтобы база данных Сподиной А. его гарантированно нашла
+        tasks = [client.get(f"{REST_CATALOG_URL}/{int(product_id)}") for product_id in keys]
         responses = await asyncio.gather(*tasks)
         
         loaded_products = []
@@ -65,7 +69,7 @@ async def batch_load_products(keys: List[str]) -> List["Product"]:
                 loaded_products.append(None)
         return loaded_products
 
-product_loader = strawberry.dataloader.DataLoader(load_fn=batch_load_products)
+product_loader = DataLoader(load_fn=batch_load_products)
 
 @strawberry.type(description="Товар, запрашиваемый из Catalog Service по REST")
 class Product:
@@ -76,31 +80,41 @@ class Product:
 @strawberry.type(description="Элемент товарной позиции в заказе")
 class OrderItem:
     quantity: int = strawberry.field(description="Количество единиц товара")
-    
-    description="Детали товара, подтягиваемые через DataLoader без N+1"
-    async def product(self, root) -> Optional[Product]:
-        return await product_loader.load(root["productId"])
+    product_id: strawberry.Private[str]
+
+    @strawberry.field(description="Детали товара, подтягиваемые через DataLoader без N+1")
+    async def product(self) -> Optional[Product]:
+        return await product_loader.load(self.product_id)
 
 @strawberry.type(description="Информация о самом заказе пользователя")
 class Order:
     id: strawberry.ID = strawberry.field(description="Номер уникального заказа")
     userId: strawberry.ID = strawberry.field(description="ID покупателя")
     createdAt: str = strawberry.field(description="Дата совершения покупки")
-    
-    description="Список содержимого корзины"
-    def items(self, root) -> List[OrderItem]:
-        return [OrderItem(quantity=item["quantity"]) for item in root["items"]]
+    items: List[OrderItem] = strawberry.field(description="Список содержимого корзины")
 
 @strawberry.type
 class Query:
-    description="Запрос получения списка заказов пользователя по его личному ID"
+    @strawberry.field(description="Запрос получения списка заказов пользователя по его личному ID")
     async def ordersByUserId(self, userId: strawberry.ID) -> List[Order]:
         user_orders = [order for order in ORDERS_DB if order["userId"] == userId]
-        return [
-            Order(id=order["id"], userId=order["userId"], createdAt=order["createdAt"]) 
-            for order in user_orders
-        ]
+        
+        result = []
+        for order in user_orders:
+            graphql_items = [
+                OrderItem(quantity=item["quantity"], product_id=item["productId"])
+                for item in order["items"]
+            ]
+            result.append(
+                Order(
+                    id=order["id"],
+                    userId=order["userId"],
+                    createdAt=order["createdAt"],
+                    items=graphql_items
+                )
+            )
+        return result
 
 schema = strawberry.Schema(query=Query)
-graphql_app = GraphQLRouter(schema, introspection=True)
+graphql_app = GraphQLRouter(schema)
 app.include_router(graphql_app, prefix="/graphql")
